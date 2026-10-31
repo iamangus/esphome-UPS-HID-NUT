@@ -8,6 +8,8 @@ from esphome.const import (
 )
 
 DEPENDENCIES = ["esp32"]
+# Bundled control sources include these headers even without control entities.
+AUTO_LOAD = ["number", "button"]
 MULTI_CONF = True
 
 CONF_SIMULATION_MODE = "simulation_mode"

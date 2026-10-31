@@ -4,6 +4,7 @@
 #include <vector>
 #include <cstdint>
 #include <memory>
+#include <string>
 
 namespace esphome {
 namespace ups_hid {
@@ -28,6 +29,15 @@ public:
     virtual bool is_connected() const = 0;
     virtual uint16_t get_vendor_id() const = 0;
     virtual uint16_t get_product_id() const = 0;
+
+    // Optional, read-only diagnostics and device identity. Simulation transports
+    // need not implement hardware descriptor requests.
+    virtual esp_err_t dump_usb_descriptors() { return ESP_ERR_NOT_SUPPORTED; }
+    virtual void loop() {}
+    virtual esp_err_t get_device_string_indices(uint8_t &manufacturer, uint8_t &product,
+                                               uint8_t &serial) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
     
     // HID communication
     virtual esp_err_t hid_get_report(uint8_t report_type, uint8_t report_id, 

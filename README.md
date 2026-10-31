@@ -1,5 +1,13 @@
 # ESPHome Components Collection
 
+## APC BR1500G on XIAO ESP32-S3
+
+This fork includes corrections based on captured BR1500G USB reports and a
+read-only HID descriptor dump accessible through ESPHome's Wi-Fi logs.
+See the [configuration example](configs/examples/br1500g-xiao.yaml) and
+[OTA diagnostic instructions](docs/br1500g-diagnostics.md). AC output voltage
+and frequency are left unavailable rather than inferred from unrelated fields.
+
 A collection of ESPHome components for various hardware integrations and monitoring solutions.
 
 ## Available Components

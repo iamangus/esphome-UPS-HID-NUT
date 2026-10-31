@@ -1,4 +1,5 @@
 #include "protocol_apc.h"
+#include "apc_report_values.h"
 #include "constants_hid.h"
 #include "constants_ups.h"
 #include "esphome/core/log.h"
@@ -39,8 +40,7 @@ static const uint8_t APC_REPORT_ID_POWER_SUMMARY = 0x0C;   // PowerSummary.Remai
 static const uint8_t APC_REPORT_ID_PRESENT_STATUS = 0x16;  // PowerSummary.PresentStatus bitmap
 static const uint8_t APC_REPORT_ID_INPUT_VOLTAGE = 0x31;   // UPS.Input.Voltage
 static const uint8_t APC_REPORT_ID_LOAD_PERCENT = 0x50;    // UPS.PowerConverter.PercentLoad  
-static const uint8_t APC_REPORT_ID_OUTPUT_VOLTAGE = 0x09;  // PowerSummary.Voltage (legacy)
-static const uint8_t APC_REPORT_ID_FREQUENCY = 0x0D;       // Frequency information
+static const uint8_t APC_REPORT_ID_SUMMARY_VOLTAGE = 0x09; // PowerSummary.Voltage: battery, NOT AC output
 
 // Extended configuration report IDs
 static const uint8_t APC_REPORT_ID_BATTERY_RUNTIME_LOW = 0x24; // Battery runtime low threshold
@@ -49,7 +49,7 @@ static const uint8_t APC_REPORT_ID_BATTERY_VOLTAGE = 0x26;  // Battery voltage a
 static const uint8_t APC_REPORT_ID_INPUT_VOLTAGE_NOMINAL = 0x30; // Input voltage nominal  
 static const uint8_t APC_REPORT_ID_DELAY_REBOOT = 0x40;    // Delay before reboot
 static const uint8_t APC_REPORT_ID_DELAY_SHUTDOWN = 0x41;  // Delay before shutdown
-static const uint8_t APC_REPORT_ID_TEST_RESULT = 0x52;     // Test result status
+static const uint8_t APC_REPORT_ID_TEST_RESULT = 0x21;     // UPS.Battery.Test (0x52 is ConfigActivePower)
 static const uint8_t APC_REPORT_ID_AUDIBLE_BEEPER = 0x78;  // Alternative beeper control
 
 // Additional report IDs found in code
@@ -121,7 +121,7 @@ bool ApcHidProtocol::detect() {
     APC_REPORT_ID_PRESENT_STATUS,  // CRITICAL: PowerSummary.PresentStatus bitmap (status flags) 
     APC_REPORT_ID_BATTERY,         // PowerSummary.APCStatusFlag (basic status byte)
     APC_REPORT_ID_STATUS,          // Legacy status check
-    APC_REPORT_ID_OUTPUT_VOLTAGE   // PowerSummary.Voltage
+    APC_REPORT_ID_SUMMARY_VOLTAGE   // PowerSummary.Voltage (battery)
   };
   
   HidReport test_report;
@@ -218,29 +218,32 @@ bool ApcHidProtocol::read_data(UpsData &data) {
     ESP_LOGV(APC_HID_TAG, "Failed to read load report");
   }
   
-  // 6. Read output voltage report (legacy voltage reading)
+  // 6. PowerSummary.Voltage is the battery bus voltage on Back-UPS.
   HidReport voltage_report;
-  if (read_hid_report(APC_REPORT_ID_OUTPUT_VOLTAGE, voltage_report)) {
+  if (read_hid_report(APC_REPORT_ID_SUMMARY_VOLTAGE, voltage_report)) {
     parse_voltage_report(voltage_report, data);
     success = true;
   } else {
     ESP_LOGV(APC_HID_TAG, "Failed to read voltage report");
   }
   
-  // Set frequency to NaN - not available in debug logs for this APC model
-  // Try to read frequency from HID reports
-  read_frequency_data(data);
-  ESP_LOGV(APC_HID_TAG, "Frequency: Not available on this UPS model");
+  // No verified AC output voltage/frequency mapping exists in this hardcoded
+  // Back-UPS layout. Never infer frequency from DesignCapacity (report 0x0D)
+  // or confuse a HID usage ID with a report ID.
+  data.power.output_voltage = NAN;
+  data.power.frequency = NAN;
   
   // TIMING FIX: Only read USB string descriptors after successful HID communication
   // This ensures the device is ready and responsive before attempting descriptor access
   if (success) {
     ESP_LOGD(APC_HID_TAG, "APC HID data read successful, now reading device info...");
     
-    // Read manufacturer from USB Manufacturer string descriptor (index 3)
-    // NUT shows: UPS.PowerSummary.iManufacturer, Value: 3 → Manufacturer: "APC"
+    // USB string indices vary by model. Read them from the device descriptor.
+    uint8_t manufacturer_index = 0, product_index = 0, serial_index = 0;
+    parent_->get_device_string_indices(manufacturer_index, product_index, serial_index);
     std::string manufacturer_string;
-    esp_err_t mfr_ret = parent_->usb_get_string_descriptor(3, manufacturer_string);
+    esp_err_t mfr_ret = manufacturer_index ? parent_->usb_get_string_descriptor(manufacturer_index, manufacturer_string)
+                                         : ESP_ERR_NOT_FOUND;
     
     if (mfr_ret == ESP_OK && !manufacturer_string.empty()) {
       data.device.manufacturer = manufacturer_string;
@@ -250,10 +253,10 @@ bool ApcHidProtocol::read_data(UpsData &data) {
       ESP_LOGW(APC_HID_TAG, "Failed to read USB Manufacturer descriptor: %s, leaving unset", esp_err_to_name(mfr_ret));
     }
     
-    // Read model from USB Product string descriptor (index 1)
-    // NUT shows: Product: "Back-UPS ES 700G" but need to parse out firmware info
+    // The product string also contains APC's firmware identifiers.
     std::string product_string;
-    esp_err_t prod_ret = parent_->usb_get_string_descriptor(1, product_string);
+    esp_err_t prod_ret = product_index ? parent_->usb_get_string_descriptor(product_index, product_string)
+                                     : ESP_ERR_NOT_FOUND;
     
     if (prod_ret == ESP_OK && !product_string.empty()) {
       // Parse out just the model name, removing firmware info like "FW:841.H1 .D USB FW:H1"
@@ -261,6 +264,12 @@ bool ApcHidProtocol::read_data(UpsData &data) {
       size_t fw_pos = model_name.find(" FW:");
       if (fw_pos != std::string::npos) {
         model_name = model_name.substr(0, fw_pos);
+        const size_t usb_fw_pos = product_string.find(" USB FW:", fw_pos);
+        data.device.firmware_version = product_string.substr(
+            fw_pos + 4, usb_fw_pos == std::string::npos ? std::string::npos : usb_fw_pos - fw_pos - 4);
+        if (usb_fw_pos != std::string::npos) {
+          data.device.firmware_aux = product_string.substr(usb_fw_pos + 8);
+        }
       }
       data.device.model = model_name;
       ESP_LOGI(APC_HID_TAG, "Successfully read APC model from USB Product descriptor: \"%s\"", data.device.model.c_str());
@@ -555,23 +564,22 @@ void ApcReportParser::parse_present_status_report(const HidReport &report, UpsDa
 }
 
 void ApcReportParser::parse_apc_status_report(const HidReport &report, UpsData &data) {
-  // APCStatusFlag report: PowerSummary.APCStatusFlag (single byte legacy status)
-  // ESP32 data format: [06 XX] where XX is the status value
-  if (report.data.size() < 2) {
+  // Report 0x06: Charging, Discharging, APCStatusFlag (three payload bytes).
+  uint8_t apc_status = 0;
+  if (!apc_report::status_flag(report.data.data(), report.data.size(), apc_status)) {
     ESP_LOGW(APC_HID_TAG, "APCStatus report too short: %zu bytes", report.data.size());
     return;
   }
   
-  // ESP32 data format: [APC_REPORT_ID_BATTERY 08] where 0x08 = AC present  
-  uint8_t apc_status = report.data[1]; // Byte 1 contains the status value
+  // Payload is Charging, Discharging, APCStatusFlag (06 01 00 08).
   ESP_LOGD(APC_HID_TAG, "Raw APCStatusFlag byte: 0x%02X", apc_status);
   ESP_LOGI(APC_HID_TAG, "APCStatusFlag: 0x%02X", apc_status);
   
   // Parse APC legacy status values from NUT logs:
   // Value 8 = AC present (UPS online)
   // Value 16 = discharging (UPS on battery) 
-  bool apc_ac_present = (apc_status == 8);
-  bool apc_discharging = (apc_status == 16);
+  bool apc_ac_present = (apc_status & 0x08) != 0;
+  bool apc_discharging = (apc_status & 0x10) != 0;
   
   // Use APCStatusFlag as backup/confirmation for PresentStatus
   // This provides additional validation of the UPS state
@@ -741,37 +749,13 @@ void ApcReportParser::parse_status_report(const HidReport &report, UpsData &data
 
 // Voltage report parsing implementation
 void ApcReportParser::parse_voltage_report(const HidReport &report, UpsData &data) {
-  if (report.data.size() < 2) {
+  if (report.data.size() < 3) {
     ESP_LOGW(APC_HID_TAG, "Voltage report too short: %zu bytes", report.data.size());
     return;
   }
   
-  // Parse voltage - handle both 2-byte and 3-byte reports
-  // report.data[0] = report ID (APC_REPORT_ID_VOLTAGE)
-  // report.data[1] = voltage (primary byte)
-  uint16_t voltage_raw = report.data[1];
-  
-  // If we have a second byte, treat it as high byte for 16-bit value
-  if (report.data.size() >= 3) {
-    voltage_raw |= (report.data[2] << 8);
-    ESP_LOGV(APC_HID_TAG, "16-bit voltage: 0x%04X", voltage_raw);
-  } else {
-    ESP_LOGV(APC_HID_TAG, "8-bit voltage: 0x%02X", voltage_raw);
-  }
-  
-  // This report provides output voltage, apply proper scaling
-  // Raw values like 0x0557 (1367) need to be scaled to reasonable voltage
-  float voltage_scaled;
-  if (voltage_raw > 1000) {
-    // Assume raw value needs scaling (e.g., 1367 → 136.7V)
-    voltage_scaled = voltage_raw / battery::VOLTAGE_SCALE_FACTOR;
-  } else {
-    voltage_scaled = static_cast<float>(voltage_raw);
-  }
-  
-  data.power.output_voltage = voltage_scaled;
-  
-  ESP_LOGI(APC_HID_TAG, "Output voltage: %.1fV", data.power.output_voltage);
+  data.battery.voltage = apc_report::battery_voltage(report.data.data(), report.data.size());
+  ESP_LOGD(APC_HID_TAG, "PowerSummary battery voltage: %.2fV", data.battery.voltage);
 }
 
 // Power report parsing implementation
@@ -911,11 +895,8 @@ void ApcHidProtocol::read_device_information(UpsData &data) {
     parse_serial_number_report(serial_report, data);
   }
   
-  // Try reading firmware version
-  HidReport firmware_report;
-  if (read_hid_report(APC_REPORT_ID_FIRMWARE, firmware_report)) {
-    parse_firmware_version_report(firmware_report, data);
-  }
+  // Firmware is parsed from the USB product string in read_data(). Report
+  // 0x04 is iOEMInformation, not a firmware revision on this layout.
   
   // Try reading beeper status
   HidReport beeper_report;
@@ -1324,8 +1305,9 @@ void ApcHidProtocol::read_missing_dynamic_values(UpsData &data) {
   // ups.firmware.aux needs to be extracted from firmware string
   // This will be handled in the existing firmware parsing logic
   
-  // Set battery status based on current battery level and charging state
-  if (!std::isnan(data.battery.level)) {
+  // Preserve Charging/Discharging and health flags from PresentStatus.
+  // Charge level alone cannot tell whether the battery is charging.
+  if (data.battery.status.empty() && !std::isnan(data.battery.level)) {
     if (data.battery.level >= 90) {
       data.battery.status = battery_status::FULL;
     } else if (data.battery.level >= 20) {
@@ -1375,44 +1357,22 @@ void ApcHidProtocol::parse_battery_voltage_actual_report(const HidReport &report
   // The value should be similar to 13.67V based on NUT debug
   uint16_t voltage_raw = report.data[1] | (report.data[2] << 8);
   
-  // Try different scaling factors to match NUT value of ~13.67V
-  float voltage_candidate1 = static_cast<float>(voltage_raw) / battery::MAX_LEVEL_PERCENT;  // Same as nominal
-  float voltage_candidate2 = static_cast<float>(voltage_raw) / battery::VOLTAGE_SCALE_FACTOR;   // Less scaling
-  float voltage_candidate3 = static_cast<float>(voltage_raw);           // No scaling
-  
-  // Choose the one closest to expected battery voltage range (10-15V)
-  if (voltage_candidate1 >= battery::VOLTAGE_SCALE_FACTOR && voltage_candidate1 <= 20.0f) {
-    data.battery.voltage = voltage_candidate1;
-    ESP_LOGI(APC_HID_TAG, "APC Battery voltage: %.2fV (raw: 0x%02X%02X = %d, scaled /100)", 
-             data.battery.voltage, report.data[2], report.data[1], voltage_raw);
-  } else if (voltage_candidate2 >= battery::VOLTAGE_SCALE_FACTOR && voltage_candidate2 <= 20.0f) {
-    data.battery.voltage = voltage_candidate2;
-    ESP_LOGI(APC_HID_TAG, "APC Battery voltage: %.2fV (raw: 0x%02X%02X = %d, scaled /10)", 
-             data.battery.voltage, report.data[2], report.data[1], voltage_raw);
-  } else if (voltage_candidate3 >= battery::VOLTAGE_SCALE_FACTOR && voltage_candidate3 <= 20.0f) {
-    data.battery.voltage = voltage_candidate3;
-    ESP_LOGI(APC_HID_TAG, "APC Battery voltage: %.2fV (raw: 0x%02X%02X = %d, no scaling)", 
-             data.battery.voltage, report.data[2], report.data[1], voltage_raw);
-  } else {
-    ESP_LOGW(APC_HID_TAG, "APC Battery voltage out of expected range: raw=%d, candidates: %.2f, %.2f, %.2f", 
-             voltage_raw, voltage_candidate1, voltage_candidate2, voltage_candidate3);
-    data.battery.voltage = voltage_candidate1; // Default to /100 scaling
-  }
+  // Centivolts, including 24V and larger battery banks. Do not guess scaling
+  // from a hardcoded 10-20V range intended for a single 12V battery.
+  data.battery.voltage = apc_report::battery_voltage(report.data.data(), report.data.size());
+  ESP_LOGD(APC_HID_TAG, "APC Battery voltage: %.2fV (raw=%u)", data.battery.voltage, voltage_raw);
 }
 
 void ApcHidProtocol::parse_input_voltage_nominal_report(const HidReport &report, UpsData &data) {
-  if (report.data.size() < 3) {
+  if (report.data.size() < 2) {
     ESP_LOGW(APC_HID_TAG, "Input voltage nominal report too short: %zu bytes", report.data.size());
     return;
   }
   
   // NUT debug: ReportID: APC_REPORT_ID_INPUT_VOLTAGE_NOMINAL, Value: 230 (UPS.Input.ConfigVoltage)
   // Data format: [ID, volt_low, volt_high] - 16-bit little endian
-  uint16_t voltage_raw = report.data[1] | (report.data[2] << 8);
-  data.power.input_voltage_nominal = static_cast<float>(voltage_raw);
-  
-  ESP_LOGI(APC_HID_TAG, "APC Input voltage nominal: %.0fV (raw: 0x%02X%02X = %d)", 
-           data.power.input_voltage_nominal, report.data[2], report.data[1], voltage_raw);
+  data.power.input_voltage_nominal = apc_report::nominal_input_voltage(report.data.data(), report.data.size());
+  ESP_LOGD(APC_HID_TAG, "APC Input voltage nominal: %.0fV", data.power.input_voltage_nominal);
 }
 
 void ApcHidProtocol::parse_input_transfer_limits_report(const HidReport &report, UpsData &data) {
@@ -1446,7 +1406,7 @@ void ApcHidProtocol::parse_battery_runtime_low_report(const HidReport &report, U
   // NUT debug: ReportID: APC_REPORT_ID_BATTERY_RUNTIME_LOW, Value: 120 (UPS.Battery.RemainingTimeLimit)
   // Data format: [ID, time_low, time_high] - 16-bit little endian
   uint16_t time_raw = report.data[1] | (report.data[2] << 8);
-  data.battery.runtime_low = static_cast<float>(time_raw);
+  data.battery.runtime_low = apc_report::runtime_low_minutes(report.data.data(), report.data.size());
   
   ESP_LOGI(APC_HID_TAG, "APC Battery runtime low threshold: %.0f minutes (raw: 0x%02X%02X = %d)", 
            data.battery.runtime_low, report.data[2], report.data[1], time_raw);
@@ -1901,172 +1861,6 @@ void ApcHidProtocol::parse_test_result_report(const HidReport &report, UpsData &
   }
   
   ESP_LOGI(APC_HID_TAG, "APC Test result: %s (raw: %d)", data.test.ups_test_result.c_str(), test_result_value);
-}
-
-void ApcHidProtocol::read_frequency_data(UpsData &data) {
-  // Initialize frequency to NaN
-  data.power.frequency = NAN;
-  
-  // Try to read frequency from various HID report IDs
-  // Based on NUT reference, frequency is typically in input/output measurement reports
-  
-  // Report IDs commonly used for frequency measurements:
-  const std::vector<uint8_t> frequency_report_ids = {
-    APC_REPORT_ID_FREQUENCY,     // APC-specific config report (apparent power and frequency) - PRIORITY
-    HID_USAGE_POW_FREQUENCY,     // Standard HID frequency usage
-    HID_USAGE_POW_VOLTAGE,       // Input measurements (may include frequency)  
-    HID_USAGE_POW_CURRENT,       // Output measurements (may include frequency)
-    HID_USAGE_POW_OUTPUT,        // Output collection (might contain frequency)
-    HID_USAGE_POW_INPUT,         // Input collection (might contain frequency)
-  };
-  
-  for (uint8_t report_id : frequency_report_ids) {
-    HidReport freq_report;
-    if (read_hid_report(report_id, freq_report)) {
-      float frequency_value = parse_frequency_from_report(freq_report);
-      if (!std::isnan(frequency_value)) {
-        data.power.frequency = frequency_value;
-        ESP_LOGD(APC_HID_TAG, "Found frequency %.1f Hz in report 0x%02X", frequency_value, report_id);
-        return;
-      }
-    }
-  }
-  
-  ESP_LOGV(APC_HID_TAG, "Frequency data not available from any HID report");
-}
-
-float ApcHidProtocol::parse_frequency_from_report(const HidReport &report) {
-  if (report.data.size() < 2) {
-    ESP_LOGV(APC_HID_TAG, "Frequency report 0x%02X too short: %zu bytes", report.data[0], report.data.size());
-    return NAN;
-  }
-  
-  ESP_LOGD(APC_HID_TAG, "Parsing frequency from report 0x%02X (%zu bytes): %02X %02X %02X %02X", 
-           report.data[0], report.data.size(), 
-           report.data.size() > 0 ? report.data[0] : 0,
-           report.data.size() > 1 ? report.data[1] : 0,
-           report.data.size() > 2 ? report.data[2] : 0,
-           report.data.size() > 3 ? report.data[3] : 0);
-  
-  // APC-specific method: Report APC_REPORT_ID_FREQUENCY frequency at byte[3] (based on ESP32 NUT server documentation)
-  if (report.data[0] == APC_REPORT_ID_FREQUENCY) {
-    ESP_LOGD(APC_HID_TAG, "APC Method - Report 0x%02X analysis: size=%zu bytes", APC_REPORT_ID_FREQUENCY, report.data.size());
-    if (report.data.size() >= 4) {
-      uint8_t freq_byte = report.data[3];
-      ESP_LOGV(APC_HID_TAG, "APC Method - Report 0x%02X byte[3]: %d (0x%02X) - Range check: %s", APC_REPORT_ID_FREQUENCY, 
-               freq_byte, freq_byte,
-               (freq_byte >= FREQUENCY_MIN_VALID && freq_byte <= FREQUENCY_MAX_VALID) ? "PASS" : "FAIL");
-      if (freq_byte >= FREQUENCY_MIN_VALID && freq_byte <= FREQUENCY_MAX_VALID) {
-        ESP_LOGI(APC_HID_TAG, "Found frequency %.0f Hz using APC Method (report 0x%02X, byte[3])", static_cast<float>(freq_byte), APC_REPORT_ID_FREQUENCY);
-        return static_cast<float>(freq_byte);
-      }
-    } else {
-      ESP_LOGW(APC_HID_TAG, "APC Method - Report 0x%02X too short for frequency: only %zu bytes (need 4+)", APC_REPORT_ID_FREQUENCY, report.data.size());
-      // Try alternative: byte[1] might contain frequency or frequency-derived value in some APC models
-      if (report.data.size() >= 2) {
-        uint8_t alt_freq = report.data[1];
-        ESP_LOGV(APC_HID_TAG, "APC Method - Report 0x%02X byte[1]: %d (0x%02X)", APC_REPORT_ID_FREQUENCY, alt_freq, alt_freq);
-        
-        // Check if this could be a frequency indicator (100 -> 50Hz, 120 -> 60Hz)
-        if (alt_freq == 100) {
-          ESP_LOGI(APC_HID_TAG, "Found frequency 50 Hz using APC Method (report 0x%02X, byte[1] = 100 -> 50Hz)", APC_REPORT_ID_FREQUENCY);
-          return 50.0f;
-        } else if (alt_freq == 120) {
-          ESP_LOGI(APC_HID_TAG, "Found frequency 60 Hz using APC Method (report 0x%02X, byte[1] = 120 -> 60Hz)", APC_REPORT_ID_FREQUENCY);
-          return 60.0f;
-        }
-      }
-    }
-  }
-  
-  // Try different byte positions and formats commonly used for frequency
-  // Most UPS devices report frequency as integer Hz (50 or 60)
-  
-  // Method 1: Single byte at position 1 (common for simple frequency reports)
-  if (report.data.size() >= 2) {
-    uint8_t freq_byte = report.data[1];
-    ESP_LOGV(APC_HID_TAG, "Method 1 - Testing byte[1]: %d (0x%02X) - Range check: %s", 
-             freq_byte, freq_byte,
-             (freq_byte >= FREQUENCY_MIN_VALID && freq_byte <= FREQUENCY_MAX_VALID) ? "PASS" : "FAIL");
-    if (freq_byte >= FREQUENCY_MIN_VALID && freq_byte <= FREQUENCY_MAX_VALID) {
-      ESP_LOGI(APC_HID_TAG, "Found frequency %.0f Hz using Method 1 (single byte)", static_cast<float>(freq_byte));
-      return static_cast<float>(freq_byte);
-    }
-  }
-  
-  // Method 2: 16-bit little-endian value at position 1-2
-  if (report.data.size() >= 3) {
-    uint16_t freq_word = report.data[1] | (report.data[2] << 8);
-    ESP_LOGV(APC_HID_TAG, "Method 2 - Testing little-endian word[1-2]: %d (0x%04X) - Range check: %s", 
-             freq_word, freq_word,
-             (freq_word >= FREQUENCY_MIN_VALID && freq_word <= FREQUENCY_MAX_VALID) ? "PASS" : "FAIL");
-    if (freq_word >= FREQUENCY_MIN_VALID && freq_word <= FREQUENCY_MAX_VALID) {
-      ESP_LOGI(APC_HID_TAG, "Found frequency %.0f Hz using Method 2 (16-bit little-endian)", static_cast<float>(freq_word));
-      return static_cast<float>(freq_word);
-    }
-  }
-  
-  // Method 3: 16-bit big-endian value at position 1-2
-  if (report.data.size() >= 3) {
-    uint16_t freq_word = (report.data[1] << 8) | report.data[2];
-    ESP_LOGV(APC_HID_TAG, "Method 3 - Testing big-endian word[1-2]: %d (0x%04X) - Range check: %s", 
-             freq_word, freq_word,
-             (freq_word >= FREQUENCY_MIN_VALID && freq_word <= FREQUENCY_MAX_VALID) ? "PASS" : "FAIL");
-    if (freq_word >= FREQUENCY_MIN_VALID && freq_word <= FREQUENCY_MAX_VALID) {
-      ESP_LOGI(APC_HID_TAG, "Found frequency %.0f Hz using Method 3 (16-bit big-endian)", static_cast<float>(freq_word));
-      return static_cast<float>(freq_word);
-    }
-  }
-  
-  // Method 4: Scaled frequency (multiply by 0.1 for devices reporting in 0.1 Hz units)
-  if (report.data.size() >= 3) {
-    uint16_t freq_scaled = report.data[1] | (report.data[2] << 8);
-    float freq_value = static_cast<float>(freq_scaled) / battery::VOLTAGE_SCALE_FACTOR;
-    ESP_LOGV(APC_HID_TAG, "Method 4 - Testing scaled frequency: raw=%d, scaled=%.1f - Range check: %s", 
-             freq_scaled, freq_value,
-             (freq_value >= FREQUENCY_MIN_VALID && freq_value <= FREQUENCY_MAX_VALID) ? "PASS" : "FAIL");
-    if (freq_value >= FREQUENCY_MIN_VALID && freq_value <= FREQUENCY_MAX_VALID) {
-      ESP_LOGI(APC_HID_TAG, "Found frequency %.1f Hz using Method 4 (scaled 0.1x)", freq_value);
-      return freq_value;
-    }
-  }
-  
-  // Method 5: APC-specific frequency encoding - scale by 0.01 (some APC models use centihz)
-  if (report.data.size() >= 3) {
-    uint16_t freq_scaled = report.data[1] | (report.data[2] << 8);
-    float freq_value = static_cast<float>(freq_scaled) / battery::MAX_LEVEL_PERCENT;
-    ESP_LOGV(APC_HID_TAG, "Method 5 - Testing APC centihz frequency: raw=%d, scaled=%.2f - Range check: %s", 
-             freq_scaled, freq_value,
-             (freq_value >= FREQUENCY_MIN_VALID && freq_value <= FREQUENCY_MAX_VALID) ? "PASS" : "FAIL");
-    if (freq_value >= FREQUENCY_MIN_VALID && freq_value <= FREQUENCY_MAX_VALID) {
-      ESP_LOGI(APC_HID_TAG, "Found frequency %.2f Hz using Method 5 (APC centihz 0.01x)", freq_value);
-      return freq_value;
-    }
-  }
-  
-  // Method 6: Try big-endian centihz scaling (some APC devices)
-  if (report.data.size() >= 3) {
-    uint16_t freq_scaled = (report.data[1] << 8) | report.data[2];
-    float freq_value = static_cast<float>(freq_scaled) / battery::MAX_LEVEL_PERCENT;
-    ESP_LOGV(APC_HID_TAG, "Method 6 - Testing APC big-endian centihz: raw=%d, scaled=%.2f - Range check: %s", 
-             freq_scaled, freq_value,
-             (freq_value >= FREQUENCY_MIN_VALID && freq_value <= FREQUENCY_MAX_VALID) ? "PASS" : "FAIL");
-    if (freq_value >= FREQUENCY_MIN_VALID && freq_value <= FREQUENCY_MAX_VALID) {
-      ESP_LOGI(APC_HID_TAG, "Found frequency %.2f Hz using Method 6 (APC big-endian centihz)", freq_value);
-      return freq_value;
-    }
-  }
-  
-  // Method 7: Check for frequency encoded in a different byte position (NUT shows various layouts)
-  for (size_t i = 1; i < report.data.size(); i++) {
-    if (report.data[i] == 50 || report.data[i] == 60) {
-      ESP_LOGI(APC_HID_TAG, "Found exact frequency %d Hz at byte[%zu]", report.data[i], i);
-      return static_cast<float>(report.data[i]);
-    }
-  }
-  
-  ESP_LOGD(APC_HID_TAG, "No valid frequency found in report 0x%02X (tried 7 methods)", report.data[0]);
-  return NAN;
 }
 
 void ApcHidProtocol::detect_nominal_power_rating(const std::string& model_name, UpsData &data) {

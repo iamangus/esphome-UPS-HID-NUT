@@ -77,6 +77,10 @@ void UpsHidComponent::update() {
   }
 }
 
+void UpsHidComponent::loop() {
+  if (transport_) transport_->loop();
+}
+
 void UpsHidComponent::dump_config() {
   ESP_LOGCONFIG(TAG, "UPS HID Component:");
   ESP_LOGCONFIG(TAG, "  Simulation Mode: %s", simulation_mode_ ? status::YES : status::NO);
@@ -137,6 +141,19 @@ esp_err_t UpsHidComponent::get_string_descriptor(uint8_t string_index, std::stri
     return ESP_ERR_INVALID_STATE;
   }
   return transport_->get_string_descriptor(string_index, result);
+}
+
+void UpsHidComponent::dump_usb_descriptors() {
+  esp_err_t ret = transport_ ? transport_->dump_usb_descriptors() : ESP_ERR_INVALID_STATE;
+  if (ret != ESP_OK) {
+    ESP_LOGW(TAG, "USB descriptor dump failed: %s", esp_err_to_name(ret));
+  }
+}
+
+esp_err_t UpsHidComponent::get_device_string_indices(uint8_t &manufacturer, uint8_t &product,
+                                                    uint8_t &serial) {
+  return transport_ ? transport_->get_device_string_indices(manufacturer, product, serial)
+                    : ESP_ERR_INVALID_STATE;
 }
 
 bool UpsHidComponent::is_connected() const {
@@ -328,9 +345,9 @@ void UpsHidComponent::update_sensors() {
       value = ups_data_.test.timer_start;
     }
     
-    if (!std::isnan(value)) {
-      sensor->publish_state(value);
-    }
+    // Publish unavailable too: otherwise an unsupported/disappeared reading
+    // can retain a stale numeric value indefinitely in Home Assistant.
+    sensor->publish_state(value);
   }
 #endif
   
@@ -342,12 +359,16 @@ void UpsHidComponent::update_sensors() {
     
     bool state = false;
     
-    if (type == binary_sensor_type::ONLINE && ups_data_.power.input_voltage_valid()) {
-      state = true;
-    } else if (type == binary_sensor_type::ON_BATTERY && ups_data_.power.input_voltage_valid()) {
-      state = false; // Opposite of online
+    if (type == binary_sensor_type::ONLINE) {
+      state = ups_data_.power.status.find(status::ONLINE) == 0 ||
+              ups_data_.power.status == "OL" || ups_data_.power.status.find("OL ") == 0;
+    } else if (type == binary_sensor_type::ON_BATTERY) {
+      state = ups_data_.power.status.find(status::ON_BATTERY) == 0 ||
+              ups_data_.power.status == "OB" || ups_data_.power.status.find("OB ") == 0;
     } else if (type == binary_sensor_type::LOW_BATTERY) {
       state = ups_data_.battery.is_low();
+    } else if (type == binary_sensor_type::CHARGING) {
+      state = ups_data_.battery.status.find(battery_status::CHARGING) == 0;
     }
     
     sensor->publish_state(state);
@@ -673,14 +694,16 @@ void UpsHidComponent::set_fast_polling_mode(bool enable) {
 // Convenient state getters for lambda expressions (no sensor entities required)
 bool UpsHidComponent::is_online() const {
   std::lock_guard<std::mutex> lock(data_mutex_);
-  // UPS is online when input voltage is valid (same logic as binary sensor update)
-  return ups_data_.power.input_voltage_valid();
+  // Use reported state, not voltage thresholds (AVR/brownouts may differ).
+  return ups_data_.power.status.find(status::ONLINE) == 0 ||
+         ups_data_.power.status == "OL" || ups_data_.power.status.find("OL ") == 0;
 }
 
 bool UpsHidComponent::is_on_battery() const {
   std::lock_guard<std::mutex> lock(data_mutex_);
-  // UPS is on battery when NOT online (opposite of online state)
-  return !ups_data_.power.input_voltage_valid();
+  // Unknown/disconnected state must not be inferred as an outage.
+  return ups_data_.power.status.find(status::ON_BATTERY) == 0 ||
+         ups_data_.power.status == "OB" || ups_data_.power.status.find("OB ") == 0;
 }
 
 bool UpsHidComponent::is_low_battery() const {
@@ -691,11 +714,8 @@ bool UpsHidComponent::is_low_battery() const {
 
 bool UpsHidComponent::is_charging() const {
   std::lock_guard<std::mutex> lock(data_mutex_);
-  // Charging when online AND battery level is not 100%
-  return ups_data_.power.input_voltage_valid() && 
-         ups_data_.battery.is_valid() && 
-         !std::isnan(ups_data_.battery.level) && 
-         ups_data_.battery.level < 100.0f;
+  // Use the UPS's charging flag rather than estimating from charge level.
+  return ups_data_.battery.status.find(battery_status::CHARGING) == 0;
 }
 
 bool UpsHidComponent::has_fault() const {

@@ -1,7 +1,9 @@
 #include "transport_esp32.h"
 #include "constants_ups.h"
+#include "usb_descriptor_utils.h"
 #include "esphome/core/log.h"
 #include "esphome/core/helpers.h"
+#include "esphome/core/hal.h"
 
 #ifdef USE_ESP32
 
@@ -84,6 +86,118 @@ uint16_t Esp32UsbTransport::get_vendor_id() const {
 uint16_t Esp32UsbTransport::get_product_id() const {
     std::lock_guard<std::mutex> lock(device_mutex_);
     return device_.product_id;
+}
+
+esp_err_t Esp32UsbTransport::get_device_string_indices(uint8_t &manufacturer, uint8_t &product,
+                                                       uint8_t &serial) {
+    std::lock_guard<std::mutex> lock(device_mutex_);
+    if (!connected_.load() || !device_.dev_hdl) return ESP_ERR_INVALID_STATE;
+    const usb_device_desc_t *desc = nullptr;
+    esp_err_t ret = usb_host_get_device_descriptor(device_.dev_hdl, &desc);
+    if (ret == ESP_OK) {
+        manufacturer = desc->iManufacturer;
+        product = desc->iProduct;
+        serial = desc->iSerialNumber;
+    }
+    return ret;
+}
+
+esp_err_t Esp32UsbTransport::dump_usb_descriptors() {
+    std::lock_guard<std::mutex> lock(device_mutex_);
+    if (!connected_.load() || !device_.dev_hdl) return ESP_ERR_INVALID_STATE;
+    if (descriptor_dump_) return ESP_ERR_INVALID_STATE;  // A dump is already in progress.
+
+    const usb_device_desc_t *device_desc = nullptr;
+    esp_err_t ret = usb_host_get_device_descriptor(device_.dev_hdl, &device_desc);
+    if (ret != ESP_OK) return ret;
+    ESP_LOGI(ESP32_USB_TAG, "USB identity: VID=%04X PID=%04X bcdDevice=%04X manufacturer_index=%u product_index=%u serial_index=%u",
+             device_desc->idVendor, device_desc->idProduct, device_desc->bcdDevice,
+             device_desc->iManufacturer, device_desc->iProduct, device_desc->iSerialNumber);
+
+    const usb_config_desc_t *config = nullptr;
+    ret = usb_host_get_active_config_descriptor(device_.dev_hdl, &config);
+    if (ret != ESP_OK) return ret;
+    const uint16_t length = hid_report_descriptor_length(
+        reinterpret_cast<const uint8_t *>(config), config->wTotalLength, device_.interface_num);
+    // Bound allocation for malformed/unexpected USB descriptors.
+    if (length == 0 || length > 4096) return ESP_ERR_INVALID_SIZE;
+
+    usb_transfer_t *transfer = nullptr;
+    ret = usb_host_transfer_alloc(sizeof(usb_setup_packet_t) + length, 0, &transfer);
+    if (ret != ESP_OK) return ret;
+    auto *setup = reinterpret_cast<usb_setup_packet_t *>(transfer->data_buffer);
+    setup->bmRequestType = 0x81;  // IN, standard, interface (read-only).
+    setup->bRequest = USB_B_REQUEST_GET_DESCRIPTOR;
+    setup->wValue = 0x2200;  // HID report descriptor, index 0.
+    setup->wIndex = device_.interface_num;
+    setup->wLength = length;
+    transfer->device_handle = device_.dev_hdl;
+    transfer->bEndpointAddress = 0;
+    transfer->num_bytes = sizeof(usb_setup_packet_t) + length;
+    transfer->timeout_ms = timing::USB_CONTROL_TRANSFER_TIMEOUT_MS;
+    auto dump = std::make_shared<DescriptorDump>();
+    dump->bytes.resize(length);
+    dump->interface_num = device_.interface_num;
+    transfer->context = new std::shared_ptr<DescriptorDump>(dump);
+    // Asynchronous: never block the USB client task or free an in-flight
+    // transfer after a semaphore timeout. The callback owns the allocation.
+    transfer->callback = [](usb_transfer_t *t) {
+        auto *context = static_cast<std::shared_ptr<DescriptorDump> *>(t->context);
+        auto &state = **context;
+        state.status = static_cast<int>(t->status);
+        if (t->actual_num_bytes >= static_cast<int>(sizeof(usb_setup_packet_t))) {
+            state.received = t->actual_num_bytes - sizeof(usb_setup_packet_t);
+            if (t->status == USB_TRANSFER_STATUS_COMPLETED && state.received == state.bytes.size()) {
+                memcpy(state.bytes.data(), t->data_buffer + sizeof(usb_setup_packet_t), state.received);
+            }
+        }
+        state.complete.store(true, std::memory_order_release);
+        delete context;
+        usb_host_transfer_free(t);
+    };
+    ret = usb_host_transfer_submit_control(device_.client_hdl, transfer);
+    if (ret != ESP_OK) {
+        delete static_cast<std::shared_ptr<DescriptorDump> *>(transfer->context);
+        usb_host_transfer_free(transfer);
+    } else {
+        descriptor_dump_ = dump;
+    }
+    return ret;
+}
+
+void Esp32UsbTransport::loop() {
+    if (!descriptor_dump_ || !descriptor_dump_->complete.load(std::memory_order_acquire)) return;
+    auto &dump = *descriptor_dump_;
+    if (dump.status != USB_TRANSFER_STATUS_COMPLETED || dump.received != dump.bytes.size()) {
+        ESP_LOGW(ESP32_USB_TAG, "HID descriptor dump failed: status=%d received=%zu expected=%zu",
+                 dump.status, dump.received, dump.bytes.size());
+        descriptor_dump_.reset();
+        return;
+    }
+    const uint32_t now = millis();
+    if (!dump.started) {
+        ESP_LOGI(ESP32_USB_TAG, "HID_REPORT_DESCRIPTOR_BEGIN interface=%u length=%zu", dump.interface_num, dump.received);
+        dump.started = true;
+    } else if (now - dump.last_log_ms < 50) {
+        return;
+    } else if (dump.offset < dump.received) {
+        std::string hex;
+        char byte[4];
+        const size_t end = std::min(dump.offset + 48, dump.received);
+        for (size_t i = dump.offset; i < end; i++) {
+            snprintf(byte, sizeof(byte), "%02X ", dump.bytes[i]);
+            hex += byte;
+        }
+        // Log in the main loop, paced to avoid overflowing the network logger's
+        // small cross-task queue. Offsets allow detecting any missing chunks.
+        ESP_LOGI(ESP32_USB_TAG, "HID_RD %04X: %s", static_cast<unsigned>(dump.offset), hex.c_str());
+        dump.offset = end;
+    } else {
+        ESP_LOGI(ESP32_USB_TAG, "HID_REPORT_DESCRIPTOR_END length=%zu", dump.received);
+        descriptor_dump_.reset();
+        return;
+    }
+    dump.last_log_ms = now;
 }
 
 esp_err_t Esp32UsbTransport::hid_get_report(uint8_t report_type, uint8_t report_id, 

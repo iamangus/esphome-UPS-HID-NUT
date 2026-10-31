@@ -33,6 +33,10 @@ public:
     bool is_connected() const override;
     uint16_t get_vendor_id() const override;
     uint16_t get_product_id() const override;
+    esp_err_t dump_usb_descriptors() override;
+    void loop() override;
+    esp_err_t get_device_string_indices(uint8_t &manufacturer, uint8_t &product,
+                                       uint8_t &serial) override;
     
     esp_err_t hid_get_report(uint8_t report_type, uint8_t report_id, 
                            uint8_t* data, size_t* data_len, 
@@ -64,6 +68,19 @@ private:
     };
     
     UsbDevice device_;
+    struct DescriptorDump {
+        std::vector<uint8_t> bytes;
+        std::atomic<bool> complete{false};
+        int status{0};
+        size_t received{0};
+        uint8_t interface_num{0};
+        size_t offset{0};
+        bool started{false};
+        uint32_t last_log_ms{0};
+    };
+    // The transfer callback owns a shared reference, so disconnect/destruction
+    // cannot leave its completion context pointing at freed transport memory.
+    std::shared_ptr<DescriptorDump> descriptor_dump_;
     mutable std::mutex device_mutex_;
     std::atomic<bool> connected_{false};
     std::atomic<bool> initialized_{false};

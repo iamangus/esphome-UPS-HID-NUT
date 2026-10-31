@@ -91,9 +91,6 @@ private:
   // Device model detection and configuration
   void detect_nominal_power_rating(const std::string& model_name, UpsData &data);
   
-  // Frequency reading methods
-  void read_frequency_data(UpsData &data);
-  float parse_frequency_from_report(const HidReport &report);
 };
 
 } // namespace ups_hid

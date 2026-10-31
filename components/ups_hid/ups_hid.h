@@ -68,6 +68,7 @@ namespace esphome
       ~UpsHidComponent() = default;
 
       void setup() override;
+      void loop() override;
       void update() override;
       void dump_config() override;
       float get_setup_priority() const override { return setup_priority::DATA; }
@@ -215,6 +216,8 @@ namespace esphome
                              const uint8_t* data, size_t data_len,
                              uint32_t timeout_ms = 1000);
       esp_err_t get_string_descriptor(uint8_t string_index, std::string& result);
+      void dump_usb_descriptors();
+      esp_err_t get_device_string_indices(uint8_t &manufacturer, uint8_t &product, uint8_t &serial);
       
       // Transport information
       bool is_connected() const;
