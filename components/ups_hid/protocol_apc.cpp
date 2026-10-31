@@ -5,7 +5,6 @@
 #include "esphome/core/log.h"
 #include "esphome/core/helpers.h"
 #include <cstring>
-#include <regex>
 #include <algorithm>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -40,6 +39,7 @@ static const uint8_t APC_REPORT_ID_POWER_SUMMARY = 0x0C;   // PowerSummary.Remai
 static const uint8_t APC_REPORT_ID_PRESENT_STATUS = 0x16;  // PowerSummary.PresentStatus bitmap
 static const uint8_t APC_REPORT_ID_INPUT_VOLTAGE = 0x31;   // UPS.Input.Voltage
 static const uint8_t APC_REPORT_ID_LOAD_PERCENT = 0x50;    // UPS.PowerConverter.PercentLoad  
+static const uint8_t APC_REPORT_ID_NOMINAL_POWER = 0x52;   // UPS.PowerConverter.ConfigActivePower
 static const uint8_t APC_REPORT_ID_SUMMARY_VOLTAGE = 0x09; // PowerSummary.Voltage: battery, NOT AC output
 
 // Extended configuration report IDs
@@ -273,9 +273,6 @@ bool ApcHidProtocol::read_data(UpsData &data) {
       }
       data.device.model = model_name;
       ESP_LOGI(APC_HID_TAG, "Successfully read APC model from USB Product descriptor: \"%s\"", data.device.model.c_str());
-      
-      // Detect and set nominal power rating based on model name
-      detect_nominal_power_rating(data.device.model, data);
     } else {
       data.device.model.clear();  // Set to unset state instead of hardcoded fallback
       ESP_LOGW(APC_HID_TAG, "Failed to read USB Product descriptor: %s, leaving model unset", esp_err_to_name(prod_ret));
@@ -1320,7 +1317,17 @@ void ApcHidProtocol::read_missing_dynamic_values(UpsData &data) {
     ESP_LOGI(APC_HID_TAG, "APC Battery status: %s (%.0f%%)", data.battery.status.c_str(), data.battery.level);
   }
   
-  // 8. Test result reading (Report APC_REPORT_ID_TEST_RESULT - same as test command)
+  // PowerConverter.ConfigActivePower is a rated wattage, not a test result.
+  // Prefer the UPS's own report to a model-name/VA-to-watts estimate. If it
+  // is absent or truncated, retain the reset state's NaN (unavailable).
+  HidReport nominal_power_report;
+  if (read_hid_report(APC_REPORT_ID_NOMINAL_POWER, nominal_power_report)) {
+    data.power.realpower_nominal = apc_report::nominal_power_watts(
+        nominal_power_report.data.data(), nominal_power_report.data.size());
+    ESP_LOGD(APC_HID_TAG, "APC nominal active power: %.0fW", data.power.realpower_nominal);
+  }
+
+  // Test result reading (Report APC_REPORT_ID_TEST_RESULT)
   // Based on NUT: "UPS.Battery.Test" maps to test result
   HidReport test_result_report;
   if (read_hid_report(APC_REPORT_ID_TEST_RESULT, test_result_report)) {
@@ -1418,12 +1425,9 @@ void ApcHidProtocol::parse_manufacture_date_report(const HidReport &report, UpsD
     return;
   }
   
-  // NUT debug shows: Value: 19257 for date "2017/09/25"
-  // Data format: [ID, date_low, date_high] - 16-bit little endian
-  // CRITICAL FIX: Raw value 0x4B39=19257 but actual device shows different value
-  // Let's see what value we actually get from this device
+  // Data format: [ID, date_low, date_high] - packed USB PDC date.
   uint16_t date_raw = report.data[1] | (report.data[2] << 8);
-  ESP_LOGW(APC_HID_TAG, "DEBUG: Date raw bytes: 0x%02X 0x%02X = %d", report.data[1], report.data[2], date_raw);
+  ESP_LOGD(APC_HID_TAG, "Date raw bytes: 0x%02X 0x%02X = %d", report.data[1], report.data[2], date_raw);
   std::string date_str = convert_apc_date(date_raw);
   
   if (is_battery) {
@@ -1861,84 +1865,6 @@ void ApcHidProtocol::parse_test_result_report(const HidReport &report, UpsData &
   }
   
   ESP_LOGI(APC_HID_TAG, "APC Test result: %s (raw: %d)", data.test.ups_test_result.c_str(), test_result_value);
-}
-
-void ApcHidProtocol::detect_nominal_power_rating(const std::string& model_name, UpsData &data) {
-  ESP_LOGD(APC_HID_TAG, "Detecting nominal power rating for model: \"%s\"", model_name.c_str());
-  
-  // APC Back-UPS ES Series Power Ratings (based on model identification)
-  // Reference: APC product specifications and actual device testing
-  
-  // Convert model name to lowercase for case-insensitive matching
-  std::string model_lower = model_name;
-  std::transform(model_lower.begin(), model_lower.end(), model_lower.begin(), ::tolower);
-  
-  float nominal_power_watts = 0.0f;
-  
-  if (model_lower.find("back-ups es 350") != std::string::npos) {
-    nominal_power_watts = 200.0f;  // 350VA ≈ 200W
-  }
-  else if (model_lower.find("back-ups es 425") != std::string::npos) {
-    nominal_power_watts = 255.0f;  // 425VA ≈ 255W  
-  }
-  else if (model_lower.find("back-ups es 500") != std::string::npos) {
-    nominal_power_watts = 300.0f;  // 500VA ≈ 300W
-  }
-  else if (model_lower.find("back-ups es 550") != std::string::npos) {
-    nominal_power_watts = 330.0f;  // 550VA ≈ 330W
-  }
-  else if (model_lower.find("back-ups es 650") != std::string::npos) {
-    nominal_power_watts = 390.0f;  // 650VA ≈ 390W
-  }
-  else if (model_lower.find("back-ups es 700") != std::string::npos || 
-           model_lower.find("back-ups es 700g") != std::string::npos) {
-    nominal_power_watts = 405.0f;  // 700VA ≈ 405W (confirmed from config)
-  }
-  else if (model_lower.find("back-ups es 750") != std::string::npos) {
-    nominal_power_watts = 450.0f;  // 750VA ≈ 450W
-  }
-  else if (model_lower.find("back-ups es 850") != std::string::npos) {
-    nominal_power_watts = 510.0f;  // 850VA ≈ 510W
-  }
-  else if (model_lower.find("back-ups es 900") != std::string::npos) {
-    nominal_power_watts = 540.0f;  // 900VA ≈ 540W
-  }
-  else if (model_lower.find("back-ups es 1000") != std::string::npos) {
-    nominal_power_watts = 600.0f;  // 1000VA ≈ 600W
-  }
-  else if (model_lower.find("back-ups es 1200") != std::string::npos) {
-    nominal_power_watts = 720.0f;  // 1200VA ≈ 720W
-  }
-  else if (model_lower.find("back-ups es 1400") != std::string::npos) {
-    nominal_power_watts = 840.0f;  // 1400VA ≈ 840W
-  }
-  
-  // Generic fallback patterns for other APC Back-UPS models
-  else if (model_lower.find("back-ups") != std::string::npos) {
-    // Try to extract VA rating from model name (e.g., "Back-UPS 1500")
-    std::regex va_pattern(R"(\b(\d{3,4})\b)");  // Match 3-4 digit numbers
-    std::smatch match;
-    if (std::regex_search(model_lower, match, va_pattern)) {
-      int va_rating = std::stoi(match[1].str());
-      // Typical APC power factor is ~0.6 for ES series, ~0.7 for higher-end
-      if (model_lower.find(" es ") != std::string::npos) {
-        nominal_power_watts = va_rating * 0.6f;  // ES series: lower power factor
-      } else {
-        nominal_power_watts = va_rating * 0.7f;  // Pro/Smart series: higher power factor
-      }
-      ESP_LOGD(APC_HID_TAG, "Extracted VA rating %d from model, calculated %0.1fW", va_rating, nominal_power_watts);
-    }
-  }
-  
-  // Set the nominal power if detected
-  if (nominal_power_watts > 0.0f) {
-    data.power.realpower_nominal = nominal_power_watts;
-    ESP_LOGI(APC_HID_TAG, "Detected APC nominal power rating: %.1fW for model \"%s\"", 
-             nominal_power_watts, model_name.c_str());
-  } else {
-    ESP_LOGW(APC_HID_TAG, "Could not determine nominal power rating for APC model: \"%s\"", model_name.c_str());
-    // Don't set realpower_nominal - leave it as NaN so template sensors can handle gracefully
-  }
 }
 
 bool ApcHidProtocol::read_timer_data(UpsData &data) {

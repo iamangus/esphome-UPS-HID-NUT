@@ -18,6 +18,12 @@ int main() {
   assert(apc_report::nominal_input_voltage(nominal120, 2) == 120);
   assert(apc_report::nominal_input_voltage(nominal230, 3) == 230);
   assert(std::isnan(apc_report::nominal_input_voltage(nominal120, 1)));
+  // 52 61 03 was previously misread as test result 97; it is 865 W.
+  const uint8_t nominal_power[] = {0x52, 0x61, 0x03};
+  assert(apc_report::nominal_power_watts(nominal_power, 3) == 865);
+  for (size_t size = 0; size < sizeof(nominal_power); size++) {
+    assert(std::isnan(apc_report::nominal_power_watts(nominal_power, size)));
+  }
   const uint8_t runtime_low[] = {0x24, 0x78, 0};
   assert(apc_report::runtime_low_minutes(runtime_low, 3) == 2);
   assert(std::isnan(apc_report::runtime_low_minutes(runtime_low, 2)));

@@ -88,9 +88,6 @@ private:
   void parse_test_result_report(const HidReport &report, UpsData &data);
   std::string convert_apc_date(uint16_t date_value);
   
-  // Device model detection and configuration
-  void detect_nominal_power_rating(const std::string& model_name, UpsData &data);
-  
 };
 
 } // namespace ups_hid

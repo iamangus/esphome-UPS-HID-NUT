@@ -20,6 +20,13 @@ inline float nominal_input_voltage(const uint8_t *data, size_t size) {
   return static_cast<float>(data[1] | (size >= 3 ? uint16_t(data[2]) << 8 : 0));
 }
 
+inline float nominal_power_watts(const uint8_t *data, size_t size) {
+  // BR1500G report 0x52: PowerConverter.ConfigActivePower, 16-bit LE,
+  // unit exponent 7 in the descriptor's SI power units (whole watts).
+  if (size < 3) return NAN;
+  return static_cast<float>(data[1] | (uint16_t(data[2]) << 8));
+}
+
 inline float runtime_low_minutes(const uint8_t *data, size_t size) {
   if (size < 3) return NAN;
   return static_cast<float>(data[1] | (uint16_t(data[2]) << 8)) / 60.0f;

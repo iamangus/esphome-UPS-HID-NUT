@@ -32,6 +32,9 @@ there is no stack completion context that could outlive a timeout.
 - USB manufacturer/product indices come from the actual device descriptor.
   Firmware comes from the product string, not the OEM-information report.
 - Test result is read from Battery.Test (`0x21`), not ConfigActivePower (`0x52`).
+- Nominal active power comes directly from ConfigActivePower (`52 61 03` =
+  **865 W**), not a guessed VA-to-watts conversion from the model name.
+- Routine manufacture-date bytes are logged at DEBUG, not WARNING.
 - Native on-battery/charging entities now use reported state, and unsupported
   numeric data in a successful poll is published as unavailable instead of
   retaining old values.
